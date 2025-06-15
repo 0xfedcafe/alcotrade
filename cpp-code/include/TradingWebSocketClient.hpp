@@ -341,34 +341,43 @@ class TradingWebSocketClient {
 
     const char* messageType = json["type"].GetString();
 
-    if (strcmp(messageType, "market_data_update") != 0) {
-      LOG_INFO << "Skipping non-market_data_update message: " << messageType;
-      return;
+    if (strcmp(messageType, "market_data_update") == 0) {
+      long timestamp = json.HasMember("time") && json["time"].IsInt64()
+                           ? json["time"].GetInt64()
+                           : 0;
+
+      // Process candles data
+      if (json.HasMember("candles") && json["candles"].IsObject()) {
+        processCandlesData(json["candles"], timestamp);
+      }
+
+      // Process orderbook depths
+      if (json.HasMember("orderbook_depths") &&
+          json["orderbook_depths"].IsObject()) {
+        processOrderbookData(json["orderbook_depths"], timestamp);
+      }
+
+      // Process events for both regular processing and ML
+      if (json.HasMember("events") && json["events"].IsArray()) {
+        processEventsData(json["events"], timestamp);
+        processTradeEventsForML(json["events"], timestamp);
+      }
+
+      // Generate ML predictions after processing all data
+      generatePredictionsAndTrade(timestamp);
+    } else if (strcmp(messageType, "add_order_response") == 0) {
+      rapidjson::StringBuffer sb;
+      rapidjson::Writer<rapidjson::StringBuffer> writer(sb);
+      json.Accept(writer);
+      std::string s = sb.GetString();
+      LOG_INFO << "ORDER RESPONSE " << s << "\n";
+    } else {
+      rapidjson::StringBuffer sb;
+      rapidjson::Writer<rapidjson::StringBuffer> writer(sb);
+      json.Accept(writer);
+      std::string s = sb.GetString();
+      LOG_ERROR << "WRONG JSON " << s << "\n";
     }
-
-    long timestamp = json.HasMember("time") && json["time"].IsInt64()
-                         ? json["time"].GetInt64()
-                         : 0;
-
-    // Process candles data
-    if (json.HasMember("candles") && json["candles"].IsObject()) {
-      processCandlesData(json["candles"], timestamp);
-    }
-
-    // Process orderbook depths
-    if (json.HasMember("orderbook_depths") &&
-        json["orderbook_depths"].IsObject()) {
-      processOrderbookData(json["orderbook_depths"], timestamp);
-    }
-
-    // Process events for both regular processing and ML
-    if (json.HasMember("events") && json["events"].IsArray()) {
-      processEventsData(json["events"], timestamp);
-      processTradeEventsForML(json["events"], timestamp);
-    }
-
-    // Generate ML predictions after processing all data
-    generatePredictionsAndTrade(timestamp);
   }
 
   void processTradeEventsForML(const rapidjson::Value& events, long timestamp) {
@@ -837,27 +846,29 @@ class TradingWebSocketClient {
 
     // Generate unique client order ID
     std::string client_order_id =
-        "order_" + std::to_string(timestamp) + "_" +
-        std::to_string(std::hash<std::string>{}(instrument) % 10000);
+        std::to_string(int(std::hash<std::string>{}(instrument)));
 
     // Create order JSON
     rapidjson::Document order_doc;
     order_doc.SetObject();
     auto& allocator = order_doc.GetAllocator();
 
+    int exp = timestamp + 3000;
 
-    int exp = timestamp + 3;
-    
-    std::string instr_name = std::get<0>(parseInstrumentName(instrument));
-    
+    std::string instr_name = "";
+
+    std::vector<std::string> parts;
+    std::stringstream ss(instrument);
+    std::getline(ss, instr_name, '_');
+
     order_doc.AddMember("type", "add_order", allocator);
-    std::string user_request_id = "something" + std::to_string(rand());
     order_doc.AddMember("user_request_id",
                         rapidjson::Value(client_order_id.c_str(), allocator),
                         allocator);
-    std::string instrument_id_str = std::format("{}_{}_{}", instr_name, target_price, 4);
+    std::string instrument_id_str = std::format(
+        "{}_{}_{}_{}", instr_name, is_buy ? "call" : "put", target_price, exp);
     order_doc.AddMember("instrument_id",
-                        rapidjson::Value(instrument_id_str.c_str(), allocator),
+                        rapidjson::Value(instrument.c_str(), allocator),
                         allocator);
     order_doc.AddMember("expiry", exp, allocator);
     order_doc.AddMember(
@@ -874,6 +885,10 @@ class TradingWebSocketClient {
     try {
       // Send the order
       LOG_INFO << "PLACING ORDER " << order_message << "\n";
+      LOG_INFO << "CONSIDERED WRONG"
+               << std::format("{}_{}_{}", instr_name, target_price, exp)
+               << "\n";
+
       wsClient->getConnection()->send(order_message);
 
       // Record the order
