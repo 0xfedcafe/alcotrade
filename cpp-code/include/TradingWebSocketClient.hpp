@@ -845,14 +845,19 @@ class TradingWebSocketClient {
     order_doc.SetObject();
     auto& allocator = order_doc.GetAllocator();
 
-    int exp = timestamp + 9 * 1000;
+
+    int exp = timestamp + 3;
+    
+    std::string instr_name = std::get<0>(parseInstrumentName(instrument));
+    
     order_doc.AddMember("type", "add_order", allocator);
     std::string user_request_id = "something" + std::to_string(rand());
     order_doc.AddMember("user_request_id",
                         rapidjson::Value(client_order_id.c_str(), allocator),
                         allocator);
+    std::string instrument_id_str = std::format("{}_{}_{}", instr_name, target_price, 4);
     order_doc.AddMember("instrument_id",
-                        rapidjson::Value(instrument.c_str(), allocator),
+                        rapidjson::Value(instrument_id_str.c_str(), allocator),
                         allocator);
     order_doc.AddMember("expiry", exp, allocator);
     order_doc.AddMember(
