@@ -72,11 +72,11 @@ struct CandleData {
       os << std::string(",,,,,,,");
     }
     if (candle[5].has_value()) {
-      os << std::format("{},{},{},{},{},{},{},", candle[5]->open,
+      os << std::format("{},{},{},{},{},{},{}", candle[5]->open,
                         candle[5]->close, candle[5]->high, candle[5]->low,
                         candle[5]->volume, candle[5]->index, candle[5]->mid);
     } else {
-      os << std::string(",,,,,,,");
+      os << std::string(",,,,,,");
     }
     os << std::string("\n");
   }
