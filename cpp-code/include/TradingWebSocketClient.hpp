@@ -134,6 +134,9 @@ class TradingWebSocketClient {
   std::unordered_map<std::string, std::string>
       server_to_client_orders_;  // optional
 
+  // Track order expiry times (client_order_id -> expiry_timestamp)
+  std::unordered_map<std::string, long> order_expiry_times_;
+
   // Rate limiting
   struct ConnectionManager {
     static constexpr int MAX_MESSAGES_PER_SECOND = 280;
@@ -185,6 +188,15 @@ class TradingWebSocketClient {
         pending_orders--;
       }
       LOG_INFO << "Order filled/cancelled, pending orders: " << pending_orders;
+    }
+
+    void resetPendingOrdersCounter() {
+      pending_orders = 0;
+      LOG_WARN << "RESET: Pending orders counter has been reset to 0";
+    }
+
+    void debugPendingOrders() {
+      LOG_INFO << "DEBUG: Current pending orders count: " << pending_orders;
     }
   } connection_mgr;
 
@@ -346,6 +358,12 @@ class TradingWebSocketClient {
                            ? json["time"].GetInt64()
                            : 0;
 
+      // Clean up expired orders first
+      cleanupExpiredOrders(timestamp);
+      
+      // Validate order counters periodically
+      validateOrderCounters();
+
       // Process candles data
       if (json.HasMember("candles") && json["candles"].IsObject()) {
         processCandlesData(json["candles"], timestamp);
@@ -371,6 +389,9 @@ class TradingWebSocketClient {
       json.Accept(writer);
       std::string s = sb.GetString();
       LOG_INFO << "ORDER RESPONSE " << s << "\n";
+
+      // Process the order response
+      handleAddOrderResponse(json);
     } else {
       rapidjson::StringBuffer sb;
       rapidjson::Writer<rapidjson::StringBuffer> writer(sb);
@@ -802,6 +823,7 @@ class TradingWebSocketClient {
     if (!connection_mgr.canPlaceOrder()) {
       LOG_WARN << "Trade decision made for " << instrument
                << " but cannot place order due to pending order limit.";
+      debugOrderState();  // Debug current state when hitting limit
       return;
     }
 
@@ -891,15 +913,16 @@ class TradingWebSocketClient {
 
       wsClient->getConnection()->send(order_message);
 
-      // Record the order
+      // Record the order and increment pending count
       active_client_orders_[client_order_id] = instrument;
+      connection_mgr.orderPlaced();  // Increment pending orders when sending
+
+      // Store expiry time for cleanup
+      order_expiry_times_[client_order_id] = exp;
 
       // Store order request for tracking server response
-      // We'll move recordMessage and orderPlaced to response handling
       LOG_INFO << "Order request sent, waiting for server confirmation: "
                << client_order_id;
-      connection_mgr.recordMessage();
-      connection_mgr.orderPlaced();
 
       LOG_INFO << "Order placed: " << (is_buy ? "BUY" : "SELL") << " "
                << quantity << " " << instrument << " at " << target_price
@@ -907,6 +930,7 @@ class TradingWebSocketClient {
 
     } catch (const std::exception& e) {
       LOG_ERROR << "Failed to send order: " << e.what();
+      // If send failed, we should not have incremented the counter, so no need to decrement
     }
   }
 
@@ -934,6 +958,55 @@ class TradingWebSocketClient {
       // Order rejected - remove from pending
       pending_client_orders_.erase(it);
       LOG_ERROR << "Order rejected by server: " << client_order_id;
+    }
+  }
+
+  void handleAddOrderResponse(const rapidjson::Document& json) {
+    if (!json.HasMember("user_request_id") ||
+        !json["user_request_id"].IsString()) {
+      LOG_ERROR << "add_order_response missing user_request_id";
+      return;
+    }
+
+    if (!json.HasMember("success") || !json["success"].IsBool()) {
+      LOG_ERROR << "add_order_response missing success field";
+      return;
+    }
+
+    std::string user_request_id = json["user_request_id"].GetString();
+    bool success = json["success"].GetBool();
+
+    // Find the instrument associated with this order
+    auto it = active_client_orders_.find(user_request_id);
+    if (it == active_client_orders_.end()) {
+      LOG_ERROR << "Received response for unknown order: " << user_request_id;
+      return;
+    }
+
+    if (success) {
+      // Only record the message on successful order placement
+      connection_mgr.recordMessage();
+
+      std::string server_order_id;
+      if (json.HasMember("data") && json["data"].IsObject() &&
+          json["data"].HasMember("order_id") &&
+          json["data"]["order_id"].IsInt()) {
+        server_order_id = std::to_string(json["data"]["order_id"].GetInt());
+
+        // Store the mapping from server order ID to client order ID
+        server_to_client_orders_[server_order_id] = user_request_id;
+      }
+
+      LOG_INFO << "Order placed successfully. Server Order ID: "
+               << server_order_id << ", User Request ID: " << user_request_id
+               << ", Instrument: " << it->second;
+    } else {
+      // Order rejected - remove from active orders and expiry tracking
+      active_client_orders_.erase(it);
+      order_expiry_times_.erase(user_request_id);
+      connection_mgr.orderFilledOrCancelled();
+      LOG_ERROR << "Order placement failed for User Request ID: "
+                << user_request_id << ", Instrument: " << it->second;
     }
   }
 
@@ -1262,20 +1335,38 @@ class TradingWebSocketClient {
              << ", Active Order ID: " << trade.activeOrderID
              << ", Passive Order ID: " << trade.passiveOrderID;
 
-    // CRITICAL: Implement logic here to check if this trade event
-    // corresponds to one of YOUR active orders.
-    // You'll need to store your client-generated order IDs when you place them.
-    // Example (requires you to manage `active_client_orders_`):
-    // if (active_client_orders_.count(trade.activeOrderID) ||
-    // active_client_orders_.count(trade.passiveOrderID)) {
-    //   LOG_INFO << "Trade event matches one of our active orders. Order ID: "
-    //            << (active_client_orders_.count(trade.activeOrderID) ?
-    //            trade.activeOrderID : trade.passiveOrderID);
-    //   connection_mgr.orderFilledOrCancelled();
-    //   // Remove the order ID from your active list
-    //   active_client_orders_.erase(trade.activeOrderID);
-    //   active_client_orders_.erase(trade.passiveOrderID);
-    // }
+    // Check if this trade event corresponds to one of YOUR active orders
+    std::string active_order_str = std::to_string(trade.activeOrderID);
+    std::string passive_order_str = std::to_string(trade.passiveOrderID);
+    
+    bool found_our_order = false;
+    std::string our_client_order_id;
+    
+    // Check if the active order ID is one of ours
+    auto active_it = server_to_client_orders_.find(active_order_str);
+    if (active_it != server_to_client_orders_.end()) {
+      our_client_order_id = active_it->second;
+      found_our_order = true;
+      server_to_client_orders_.erase(active_it);
+    }
+    
+    // Check if the passive order ID is one of ours
+    auto passive_it = server_to_client_orders_.find(passive_order_str);
+    if (passive_it != server_to_client_orders_.end()) {
+      our_client_order_id = passive_it->second;
+      found_our_order = true;
+      server_to_client_orders_.erase(passive_it);
+    }
+    
+    if (found_our_order) {
+      LOG_INFO << "Trade event matches one of our active orders. Client Order ID: " 
+               << our_client_order_id;
+      connection_mgr.orderFilledOrCancelled();
+      
+      // Remove the order from active tracking
+      active_client_orders_.erase(our_client_order_id);
+      order_expiry_times_.erase(our_client_order_id);
+    }
 
     dumpTradeFeatures(trade);
   }
@@ -1283,14 +1374,81 @@ class TradingWebSocketClient {
   virtual void onCancelEvent(const CancelEvent& cancel) {
     LOG_INFO << "Cancel event received for order ID: " << cancel.orderID;
 
-    // CRITICAL: Implement logic here to check if this cancel event
-    // corresponds to one of YOUR active orders.
-    // Example (requires you to manage `active_client_orders_`):
-    // if (active_client_orders_.count(cancel.orderID)) {
-    //   LOG_INFO << "Cancel event matches one of our active orders. Order ID: "
-    //   << cancel.orderID; connection_mgr.orderFilledOrCancelled();
-    //   // Remove the order ID from your active list
-    //   active_client_orders_.erase(cancel.orderID);
-    // }
+    // Check if this cancel event corresponds to one of YOUR active orders
+    std::string cancel_order_str = std::to_string(cancel.orderID);
+    
+    auto it = server_to_client_orders_.find(cancel_order_str);
+    if (it != server_to_client_orders_.end()) {
+      std::string our_client_order_id = it->second;
+      LOG_INFO << "Cancel event matches one of our active orders. Client Order ID: " 
+               << our_client_order_id;
+      connection_mgr.orderFilledOrCancelled();
+      
+      // Remove the order from all tracking structures
+      active_client_orders_.erase(our_client_order_id);
+      order_expiry_times_.erase(our_client_order_id);
+      server_to_client_orders_.erase(it);
+    }
+  }
+
+  void cleanupExpiredOrders(long current_timestamp) {
+    std::vector<std::string> expired_orders;
+
+    // Find expired orders
+    for (const auto& [client_order_id, expiry_time] : order_expiry_times_) {
+      if (current_timestamp >= expiry_time) {
+        expired_orders.push_back(client_order_id);
+      }
+    }
+
+    // Remove expired orders from all tracking structures
+    for (const std::string& client_order_id : expired_orders) {
+      LOG_INFO << "Order expired and removed: " << client_order_id;
+
+      // Remove from active orders
+      active_client_orders_.erase(client_order_id);
+
+      // Remove expiry tracking
+      order_expiry_times_.erase(client_order_id);
+
+      // Find and remove server order mapping if it exists
+      for (auto it = server_to_client_orders_.begin();
+           it != server_to_client_orders_.end(); ++it) {
+        if (it->second == client_order_id) {
+          server_to_client_orders_.erase(it);
+          break;
+        }
+      }
+
+      // Decrement pending orders count to free up the slot
+      connection_mgr.orderFilledOrCancelled();
+    }
+  }
+
+  // Add a public method to reset pending orders counter if needed
+  void resetPendingOrders() {
+    connection_mgr.resetPendingOrdersCounter();
+    connection_mgr.debugPendingOrders();
+  }
+  
+  void debugOrderState() {
+    connection_mgr.debugPendingOrders();
+    LOG_INFO << "Active client orders: " << active_client_orders_.size();
+    LOG_INFO << "Server to client mappings: " << server_to_client_orders_.size();
+    LOG_INFO << "Order expiry times: " << order_expiry_times_.size();
+  }
+
+  void validateOrderCounters() {
+    // If we have a huge mismatch between pending orders and actual tracked orders,
+    // there's likely a bug - reset the counter
+    int actual_tracked = active_client_orders_.size();
+    int pending_count = connection_mgr.pending_orders;
+    
+    if (pending_count > actual_tracked + 50) {  // Allow some buffer for in-flight orders
+      LOG_WARN << "COUNTER MISMATCH: Pending=" << pending_count 
+               << ", Tracked=" << actual_tracked 
+               << ". Resetting counter to tracked count.";
+      connection_mgr.pending_orders = actual_tracked;
+    }
   }
 };
