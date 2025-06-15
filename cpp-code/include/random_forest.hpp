@@ -1,6 +1,6 @@
 #pragma once
 #include <cmath>
-#include <cstdio>  // For fprintf, if not already included by iostream/other headers indirectly
+#include <cstdio> // For fprintf, if not already included by iostream/other headers indirectly
 #include <limits>
 #include <string>
 #include <vector>
@@ -27,11 +27,8 @@ class RandomForestRegressor {
 
   double predict(const std::vector<double>& features) const {
     if (n_trees == 0) {
-      fprintf(stderr,
-              "CRITICAL ERROR: RandomForestRegressor::predict called when "
-              "n_trees = 0. Model was not loaded correctly or the model file "
-              "is empty/corrupt. Returning NaN.\n");
-      return std::numeric_limits<double>::quiet_NaN();  // Or return 0.0;
+      fprintf(stderr, "CRITICAL ERROR: RandomForestRegressor::predict called when n_trees = 0. Model was not loaded correctly or the model file is empty/corrupt. Returning NaN.\n");
+      return std::numeric_limits<double>::quiet_NaN(); // Or return 0.0;
     }
     double sum = 0.0;
     for (const auto& tree : trees) {

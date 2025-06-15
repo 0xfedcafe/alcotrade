@@ -7,8 +7,8 @@
 #include <trantor/utils/Logger.h>
 
 #include <fstream>
-#include <iomanip>
-#include <limits>
+#include <iomanip>  // Required for std::fixed and std::setprecision
+#include <limits>   // Required for std::numeric_limits
 #include <map>
 #include <numeric>
 #include <optional>
@@ -22,15 +22,11 @@
 struct InstrumentFeatures {
   // Price features
   double open = 0, close = 0, high = 0, low = 0;
-  double volume = 0,
-         underlying_price =
-             0;  // For options, this is the spot price of the underlying. For
-                 // futures, could be its own price or 0.
+  double volume = 0, underlying_price = 0;
 
   // Options features
-  double time_to_expiry = 0;  // Applicable to options and futures
-  double moneyness = 0;  // Primarily for options. Can be 0 or a conventional
-                         // value for futures.
+  double time_to_expiry = 0;
+  double moneyness = 0;
 
   // Orderbook features
   double spread = 0, mid_price = 0;
@@ -43,26 +39,72 @@ struct InstrumentFeatures {
   // Technical indicators
   double price_momentum_5s = 0, volume_momentum_5s = 0;
   double rsi_14 = 0;
-  double bb_sma_20 = 0;     // Example: Moving Average for Bollinger Bands
-  double bb_stddev_20 = 0;  // Example: Standard Deviation for Bollinger Bands
+  double bb_sma_20 = 0;
+  double bb_stddev_20 = 0;
   double bb_upper_band = 0;
   double bb_lower_band = 0;
-  // bb_position could be (price - lower_band) / (upper_band - lower_band)
-  // or (price - sma) / (2*stddev)
-  double bb_position = 0;  // This needs to be calculated
+  double bb_position = 0;
+
+  // Add feature scaling constants (these should match your training data)
+  static constexpr double PRICE_SCALE = 100000.0;  // Scale prices to 0-1 range
+  static constexpr double VOLUME_SCALE = 1000000.0;  // Scale volumes
+  static constexpr double TIME_SCALE = 86400.0;      // Convert to days
 
   std::vector<double> toVector() const {
-    return std::vector<double>{
-        open, close, high, low, volume, underlying_price, time_to_expiry,
-        moneyness, spread, mid_price, bid_ask_ratio, depth_imbalance,
-        trade_volume_1min, avg_trade_price_1min, price_volatility_1min,
-        trade_count_1min, price_momentum_5s, volume_momentum_5s, rsi_14,
-        // Add Bollinger Band related features if calculated
-        // bb_sma_20,
-        // bb_stddev_20,
-        // bb_upper_band,
-        // bb_lower_band,
-        bb_position};
+    // Properly scale all features to match training data format
+    // std::vector<double> features = {
+    //     open / PRICE_SCALE,
+    //     close / PRICE_SCALE,
+    //     high / PRICE_SCALE,
+    //     low / PRICE_SCALE,
+    //     std::min(volume / VOLUME_SCALE, 1.0),  // Cap volume at 1.0
+    //     underlying_price / PRICE_SCALE,
+    //     std::min(time_to_expiry / TIME_SCALE, 1.0),  // Convert to days, cap
+    //     at 1 std::tanh(moneyness),  // Normalize moneyness using tanh
+    //     std::min(spread / 1000.0, 1.0),  // Scale spread
+    //     mid_price / PRICE_SCALE,
+    //     std::min(bid_ask_ratio, 10.0) / 10.0,  // Cap and scale ratio
+    //     std::tanh(depth_imbalance),  // Normalize imbalance
+    //     std::min(trade_volume_1min / VOLUME_SCALE, 1.0),
+    //     avg_trade_price_1min / PRICE_SCALE,
+    //     std::min(price_volatility_1min, 1.0),  // Cap volatility
+    //     std::min(trade_count_1min / 100.0, 1.0),  // Scale trade count
+    //     std::tanh(price_momentum_5s),  // Normalize momentum
+    //     std::tanh(volume_momentum_5s),
+    //     rsi_14 / 100.0,  // RSI is already 0-100, scale to 0-1
+    //     bb_position  // BB position should already be normalized
+    // };
+
+    // Properly scale all features to match training data format
+    std::vector<double> features = {open,
+                                    close,
+                                    high,
+                                    low,
+                                    volume,
+                                    underlying_price,
+                                    time_to_expiry,
+                                    moneyness,
+                                    spread,
+                                    mid_price,
+                                    bid_ask_ratio,
+                                    depth_imbalance,
+                                    trade_volume_1min,
+                                    avg_trade_price_1min,
+                                    price_volatility_1min,
+                                    trade_count_1min,
+                                    price_momentum_5s,
+                                    volume_momentum_5s,
+                                    rsi_14,
+                                    bb_position};
+
+    // Validate features (replace NaN/inf with 0)
+    for (auto& feature : features) {
+      if (!std::isfinite(feature)) {
+        feature = 0.0;
+      }
+    }
+
+    return features;
   }
 };
 
@@ -144,10 +186,9 @@ class TradingWebSocketClient {
   } connection_mgr;
 
  public:
-  TradingWebSocketClient(
-      const std::string& server, uint16_t port,
-      const std::string& price_model_path,
-      const std::string& direction_model_path)  // Add model paths
+  TradingWebSocketClient(const std::string& server, uint16_t port,
+                         const std::string& price_model_path,
+                         const std::string& direction_model_path)
       : outputFile("trading_log.json"),
         csvUnderlyingPrices("dataframe.csv"),
         csvOrderbookData("orderbook_data.csv"),
@@ -155,6 +196,8 @@ class TradingWebSocketClient {
         csvTradeEvents("trade_events.csv") {
     std::string serverString = server + ":" + std::to_string(port);
     wsClient = drogon::WebSocketClient::newWebSocketClient(serverString);
+
+    // CSV headers setup
     csvUnderlyingPrices << "Tick,";
     csvUnderlyingPrices << "$CARD open,$CARD close,$CARD high,$CARD low,$CARD "
                            "volume,$CARD index,$CARD mid,";
@@ -174,28 +217,44 @@ class TradingWebSocketClient {
     csvTradeableInstruments << "open,close,high,low,volume,index,";
     csvTradeableInstruments << "underlying_price,time_to_expiry,moneyness\n";
 
-    // Headers for orderbook data
     csvOrderbookData
         << "timestamp,instrument_id,side,price_level,price,quantity,";
     csvOrderbookData << "spread,mid_price,bid_ask_ratio,depth_imbalance\n";
 
-    // Headers for trade events
     csvTradeEvents << "timestamp,instrument_id,price,quantity,";
     csvTradeEvents << "passive_order_id,active_order_id,trade_direction\n";
 
-    // !!! CRITICAL: Load your models !!!
+    // Load and validate models
     try {
       LOG_INFO << "Loading price model from: " << price_model_path;
       price_model.loadModel(price_model_path);
-      LOG_INFO << "Price model loaded successfully.";
 
       LOG_INFO << "Loading direction model from: " << direction_model_path;
       direction_model.loadModel(direction_model_path);
-      LOG_INFO << "Direction model loaded successfully.";
+
+      // Test models with dummy data
+      std::vector<double> test_features(20, 0.5);  // 20 features, all 0.5
+
+      double test_price_pred = price_model.predict(test_features);
+      double test_direction_pred = direction_model.predict(test_features);
+
+      LOG_INFO << "Model validation - Price prediction: " << test_price_pred;
+      LOG_INFO << "Model validation - Direction prediction: "
+               << test_direction_pred;
+
+      if (std::isnan(test_price_pred) || std::isnan(test_direction_pred)) {
+        throw std::runtime_error("Models return NaN values");
+      }
+
+      if (test_price_pred == 0.0 && test_direction_pred == 0.0) {
+        LOG_WARN << "Models might not be properly loaded (returning zeros)";
+      }
+
+      LOG_INFO << "Models loaded and validated successfully";
+
     } catch (const std::exception& e) {
       LOG_ERROR << "Failed to load ML models: " << e.what();
-      // Depending on your strategy, you might want to throw here or handle this
-      // state
+      LOG_ERROR << "Trading system will run in data collection mode only";
     }
 
     wsClient->setMessageHandler(
@@ -290,23 +349,23 @@ class TradingWebSocketClient {
 
     // Process candles data
     if (json.HasMember("candles") && json["candles"].IsObject()) {
-      this->processCandlesData(json["candles"], timestamp);
+      processCandlesData(json["candles"], timestamp);
     }
 
     // Process orderbook depths
     if (json.HasMember("orderbook_depths") &&
         json["orderbook_depths"].IsObject()) {
-      this->processOrderbookData(json["orderbook_depths"], timestamp);
+      processOrderbookData(json["orderbook_depths"], timestamp);
     }
 
     // Process events for both regular processing and ML
     if (json.HasMember("events") && json["events"].IsArray()) {
-      this->processEventsData(json["events"], timestamp);
-      this->processTradeEventsForML(json["events"], timestamp);
+      processEventsData(json["events"], timestamp);
+      processTradeEventsForML(json["events"], timestamp);
     }
 
     // Generate ML predictions after processing all data
-    this->generatePredictionsAndTrade(timestamp);
+    generatePredictionsAndTrade(timestamp);
   }
 
   void processTradeEventsForML(const rapidjson::Value& events, long timestamp) {
@@ -408,176 +467,194 @@ class TradingWebSocketClient {
     auto [type, underlying, strike, expiry_day_or_timestamp] =
         parseInstrumentName(instrument);
 
-    // Assuming expiry_day_or_timestamp is a full timestamp for options/futures
-    // from parsing If it's a day number, it needs conversion to a comparable
-    // timestamp or duration
-    features.time_to_expiry =
-        static_cast<double>(expiry_day_or_timestamp - timestamp);
-    // Ensure time_to_expiry is non-negative; could be 0 if
-    // expiry_day_or_timestamp is not a future time
-    if (features.time_to_expiry < 0) features.time_to_expiry = 0;
+    // Fix time to expiry calculation
+    if (expiry_day_or_timestamp > 1000000000) {
+      // It's a timestamp in seconds
+      features.time_to_expiry = std::max(
+          0.0,
+          static_cast<double>(expiry_day_or_timestamp - timestamp) / 86400.0);
+    } else {
+      // It's a day number, convert to days from now (assuming day 0 = today)
+      features.time_to_expiry =
+          std::max(0.0, static_cast<double>(expiry_day_or_timestamp));
+    }
 
     if (type == "call" || type == "put") {
-      auto underlying_price_val = getUnderlyingPrice(underlying);
-      if (underlying_price_val > 0) {
-        features.underlying_price = underlying_price_val;
-        features.moneyness = static_cast<double>(strike) / underlying_price_val;
+      double underlying_price = getUnderlyingPrice(underlying);
+      features.underlying_price = underlying_price;
+
+      if (underlying_price > 0 && strike > 0) {
+        features.moneyness = (underlying_price - strike) / strike;
       } else {
-        features.underlying_price = 0;
-        features.moneyness = 0;
-        LOG_WARN
-            << "Moneyness calculation: underlying price is 0 or invalid for "
-            << underlying << ". Instrument: " << instrument
-            << ", Type: " << type;
+        features.moneyness = 0.0;
       }
-    } else if (type == "future") {
-      // For futures, 'underlying_price' could be its own price, and 'moneyness'
-      // might be 0 or not applicable.
-      features.underlying_price =
-          candle.close;  // Or candle.mid. Using its own price.
-      features.moneyness =
-          0;  // Or a conventional value if your model expects one for futures.
-      // Strike is not applicable for futures in the same way as options.
-    } else if (type == "spot") {
-      // For spot, underlying_price is its own price, moneyness and
-      // time_to_expiry might be 0.
-      features.underlying_price = candle.close;  // Or candle.mid
-      features.moneyness = 0;
-      features.time_to_expiry = 0;  // Spot doesn't expire
-    } else {                        // "unknown" type from parsing
-      features.underlying_price = 0;
-      features.moneyness = 0;
-      // time_to_expiry might be invalid due to parsing returning 0 for
-      // expiry_day_or_timestamp
-      LOG_WARN << "Unknown instrument type '" << type << "' for " << instrument
-               << ". Features might be incorrect.";
+    } else {
+      // For futures, use the instrument's own price as underlying
+      features.underlying_price = features.close;
+      features.moneyness = 0.0;  // Not applicable for futures
     }
 
     // Store history
     history.push_back(candle);
-    if (history.size() > 300) {  // Max history size for TA indicators
+    if (history.size() > 300) {
       history.pop_front();
     }
 
     // Calculate technical indicators
     calculateTechnicalIndicators(features, history);
-    // TODO: Calculate Bollinger Bands and bb_position here if desired
-    // calculateBollingerBands(features, history);
   }
 
   void calculateTechnicalIndicators(InstrumentFeatures& features,
                                     const std::deque<CandleData>& history) {
-    if (history.empty()) return;  // Guard against empty history
+    if (history.empty()) {
+      return;  // Guard against empty history
+    }
 
-    // Price momentum (5-second)
+    // Price momentum (5-second) - use percentage change
     if (history.size() >= 5) {
-      const auto& prev_candle = history[history.size() - 5];
-      if (prev_candle.close != 0) {
-        features.price_momentum_5s =
-            (history.back().close - prev_candle.close) /
-            static_cast<double>(prev_candle.close);
+      double old_price = history[history.size() - 5].close;
+      double new_price = history.back().close;
+      if (old_price > 0) {
+        features.price_momentum_5s = (new_price - old_price) / old_price;
       } else {
-        features.price_momentum_5s = 0;
+        features.price_momentum_5s = 0.0;
       }
     } else {
-      features.price_momentum_5s = 0;
+      features.price_momentum_5s = 0.0;
     }
 
-    // Volume momentum
-    if (history.size() >= 10) {  // Need at least 10 for 5 old and 5 recent
-      double recent_vol = 0, old_vol = 0;
-      // Sum volume for the most recent 5 candles
-      for (size_t i = history.size() - 5; i < history.size(); i++) {
-        recent_vol += history[i].volume;
+    // Volume momentum - use ratio instead of difference
+    if (history.size() >= 10) {
+      double old_vol = 0.0, new_vol = 0.0;
+      for (size_t i = 0; i < 5 && i < history.size(); ++i) {
+        new_vol += history[history.size() - 1 - i].volume;
       }
-      // Sum volume for the 5 candles before the most recent 5
-      for (size_t i = history.size() - 10; i < history.size() - 5; i++) {
-        old_vol += history[i].volume;
+      for (size_t i = 5; i < 10 && i < history.size(); ++i) {
+        old_vol += history[history.size() - 1 - i].volume;
       }
-      features.volume_momentum_5s =
-          old_vol > 0 ? (recent_vol - old_vol) / old_vol : 0;
+      if (old_vol > 0) {
+        features.volume_momentum_5s = (new_vol - old_vol) / old_vol;
+      } else {
+        features.volume_momentum_5s = 0.0;
+      }
     } else {
-      features.volume_momentum_5s = 0;
+      features.volume_momentum_5s = 0.0;
     }
 
-    // Simple RSI calculation
-    if (history.size() >= 15) {  // Need 14 periods, so 15 data points
-      double gains = 0, losses = 0;
-      // Iterate over the last 14 periods (differences between 15 candles)
-      for (size_t i = history.size() - 14; i < history.size(); i++) {
-        double change =
-            history[i].close - history[i - 1].close;  // current vs previous
-        if (change > 0)
-          gains += change;
-        else
-          losses += -change;
+    // Simple RSI calculation (14 periods)
+    if (history.size() >= 15) {
+      double gain = 0.0, loss = 0.0;
+      for (size_t i = history.size() - 14; i < history.size(); ++i) {
+        double change = history[i].close - history[i - 1].close;
+        if (change > 0) {
+          gain += change;
+        } else {
+          loss -= change;  // Make positive
+        }
       }
-      double avg_gain = gains / 14.0;
-      double avg_loss = losses / 14.0;
-      if (avg_loss > 0) {
-        double rs = avg_gain / avg_loss;
+
+      if (gain + loss > 0) {
+        double rs = gain / loss;
         features.rsi_14 = 100.0 - (100.0 / (1.0 + rs));
       } else {
-        features.rsi_14 = 100;  // Typically indicates very strong upward
-                                // momentum if no losses
+        features.rsi_14 = 50.0;  // Neutral RSI
       }
     } else {
-      features.rsi_14 = 50;  // Neutral RSI if not enough data
+      features.rsi_14 = 50.0;  // Default neutral RSI
+    }
+
+    // Calculate Bollinger Bands (20 period)
+    if (history.size() >= 20) {
+      double sum = 0.0;
+      for (size_t i = history.size() - 20; i < history.size(); ++i) {
+        sum += history[i].close;
+      }
+      features.bb_sma_20 = sum / 20.0;
+
+      double variance = 0.0;
+      for (size_t i = history.size() - 20; i < history.size(); ++i) {
+        double diff = history[i].close - features.bb_sma_20;
+        variance += diff * diff;
+      }
+      features.bb_stddev_20 = std::sqrt(variance / 20.0);
+
+      features.bb_upper_band =
+          features.bb_sma_20 + (2.0 * features.bb_stddev_20);
+      features.bb_lower_band =
+          features.bb_sma_20 - (2.0 * features.bb_stddev_20);
+
+      // Calculate BB position
+      double current_price = history.back().close;
+      if (features.bb_upper_band > features.bb_lower_band) {
+        features.bb_position =
+            (current_price - features.bb_lower_band) /
+            (features.bb_upper_band - features.bb_lower_band);
+      } else {
+        features.bb_position = 0.5;  // Neutral position
+      }
+    } else {
+      features.bb_sma_20 = history.back().close;
+      features.bb_stddev_20 = 0.0;
+      features.bb_upper_band = features.bb_sma_20;
+      features.bb_lower_band = features.bb_sma_20;
+      features.bb_position = 0.5;
     }
   }
 
-  void calculateOrderbookFeatures(
-      InstrumentFeatures& features, const OrderBookLevel& orderbook,
-      const std::string& instrument_name_for_log /* For logging */) {
+  void calculateOrderbookFeatures(InstrumentFeatures& features,
+                                  const OrderBookLevel& orderbook,
+                                  const std::string& instrument_name_for_log) {
     if (orderbook.bids.empty() || orderbook.asks.empty()) {
-      // Set features to neutral/default values if orderbook is empty or
-      // one-sided
-      features.spread = 0;  // Or a very large number if that's more indicative
-      features.mid_price = 0;        // Or last known mid_price if available
-      features.bid_ask_ratio = 1;    // Neutral ratio
-      features.depth_imbalance = 0;  // Neutral imbalance
-      // LOG_WARN << "Orderbook empty or one-sided for " <<
-      // instrument_name_for_log << ". Setting orderbook features to default.";
+      LOG_WARN << "Empty orderbook for " << instrument_name_for_log;
+      features.spread = 0;
+      features.mid_price = 0;
+      features.bid_ask_ratio = 1.0;  // Neutral
+      features.depth_imbalance = 0.0;
       return;
     }
 
-    int best_bid = orderbook.bids.rbegin()->first;
-    int best_ask = orderbook.asks.begin()->first;
+    double best_bid = static_cast<double>(orderbook.bids.rbegin()->first);
+    double best_ask = static_cast<double>(orderbook.asks.begin()->first);
 
     features.spread = best_ask - best_bid;
-    if (features.spread < 0) {  // Should not happen in a valid order book
-      LOG_WARN << "Negative spread calculated for " << instrument_name_for_log
-               << "! Best Bid: " << best_bid << ", Best Ask: " << best_ask;
-      features.spread = 0;  // Or handle as error
+    if (features.spread < 0) {
+      LOG_WARN << "Negative spread for " << instrument_name_for_log << ": "
+               << features.spread;
+      features.spread = 0;
     }
     features.mid_price = (best_bid + best_ask) / 2.0;
 
-    long long total_bid_vol =
-        0;  // Use long long to prevent overflow if quantities are large
+    long long total_bid_vol = 0;
     long long total_ask_vol = 0;
-    for (const auto& [price, qty] : orderbook.bids) {
-      total_bid_vol += qty;
+
+    // Sum top 5 levels for better depth calculation
+    int levels_counted = 0;
+    for (auto it = orderbook.bids.rbegin();
+         it != orderbook.bids.rend() && levels_counted < 5;
+         ++it, ++levels_counted) {
+      total_bid_vol += it->second;
     }
-    for (const auto& [price, qty] : orderbook.asks) {
-      total_ask_vol += qty;
+
+    levels_counted = 0;
+    for (auto it = orderbook.asks.begin();
+         it != orderbook.asks.end() && levels_counted < 5;
+         ++it, ++levels_counted) {
+      total_ask_vol += it->second;
     }
 
     if (total_ask_vol > 0) {
-      features.bid_ask_ratio =
-          static_cast<double>(total_bid_vol) / total_ask_vol;
+      features.bid_ask_ratio = static_cast<double>(total_bid_vol) /
+                               static_cast<double>(total_ask_vol);
     } else {
-      // Ask side is empty. If bid side has volume, ratio is "infinite".
-      // Cap at a large value or use a specific indicator. 0 is misleading.
-      features.bid_ask_ratio =
-          (total_bid_vol > 0) ? 1.0e9 : 1.0;  // Large value or 1 if both empty
+      features.bid_ask_ratio = 1.0;
     }
 
     if (total_bid_vol + total_ask_vol > 0) {
       features.depth_imbalance =
           static_cast<double>(total_bid_vol - total_ask_vol) /
-          (total_bid_vol + total_ask_vol);
+          static_cast<double>(total_bid_vol + total_ask_vol);
     } else {
-      features.depth_imbalance = 0;  // Both sides empty, neutral imbalance
+      features.depth_imbalance = 0.0;
     }
   }
 
@@ -730,87 +807,112 @@ class TradingWebSocketClient {
   // Fix the placeOrder method
   void placeOrder(const std::string& instrument, bool is_buy,
                   const OrderBookLevel& orderbook, long timestamp) {
-    // Check if connection is active
+    // Check if WebSocket connection is active
     if (!wsClient || !wsClient->getConnection() ||
         !wsClient->getConnection()->connected()) {
-      LOG_ERROR << "Cannot place order: WebSocket not connected or connection "
-                   "not active.";
+      LOG_ERROR << "WebSocket not connected - cannot place order";
       return;
     }
 
     // Double check rate limits just before sending
-    if (!connection_mgr.canSendMessage()) {
-      LOG_WARN << "PlaceOrder: Aborted for " << instrument
-               << " due to message rate limit just before sending.";
+    if (!connection_mgr.canSendMessage() || !connection_mgr.canPlaceOrder()) {
+      LOG_WARN << "Rate/order limits hit at order placement time";
       return;
     }
-    if (!connection_mgr.canPlaceOrder()) {
-      LOG_WARN << "PlaceOrder: Aborted for " << instrument
-               << " due to pending order limit just before sending.";
-      return;
+
+    // Calculate order parameters
+    int target_price;
+    int quantity = 1;  // Start with small quantities
+
+    if (is_buy) {
+      // Buy at best ask (market order) or slightly better
+      target_price = orderbook.asks.begin()->first;
+    } else {
+      // Sell at best bid (market order) or slightly better
+      target_price = orderbook.bids.rbegin()->first;
     }
+
+    // Generate unique client order ID
+    std::string client_order_id =
+        "order_" + std::to_string(timestamp) + "_" +
+        std::to_string(std::hash<std::string>{}(instrument) % 10000);
+
+    // Create order JSON
+    rapidjson::Document order_doc;
+    order_doc.SetObject();
+    auto& allocator = order_doc.GetAllocator();
+
+    int exp = timestamp + 9 * 1000;
+    order_doc.AddMember("type", "add_order", allocator);
+    std::string user_request_id = "something" + std::to_string(rand());
+    order_doc.AddMember("user_request_id",
+                        rapidjson::Value(client_order_id.c_str(), allocator),
+                        allocator);
+    order_doc.AddMember("instrument_id",
+                        rapidjson::Value(instrument.c_str(), allocator),
+                        allocator);
+    order_doc.AddMember("expiry", exp, allocator);
+    order_doc.AddMember(
+        "side", rapidjson::Value(is_buy ? "bid" : "ask", allocator), allocator);
+    order_doc.AddMember("price", target_price, allocator);
+    order_doc.AddMember("quantity", quantity, allocator);
+
+    // Convert to string
+    rapidjson::StringBuffer buffer;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+    order_doc.Accept(writer);
+    std::string order_message = buffer.GetString();
 
     try {
-      // Calculate order parameters
-      int target_price;
-      if (is_buy) {
-        if (orderbook.asks.empty()) {
-          LOG_WARN << "Cannot place BUY order for " << instrument
-                   << ": asks are empty.";
-          return;
-        }
-        target_price = orderbook.asks.begin()->first;  // Buy at best ask
-      } else {
-        if (orderbook.bids.empty()) {
-          LOG_WARN << "Cannot place SELL order for " << instrument
-                   << ": bids are empty.";
-          return;
-        }
-        target_price = orderbook.bids.rbegin()->first;  // Sell at best bid
-      }
+      // Send the order
+      LOG_INFO << "PLACING ORDER " << order_message << "\n";
+      wsClient->getConnection()->send(order_message);
 
-      int quantity = 1;  // Start with small quantities
+      // Record the order
+      active_client_orders_[client_order_id] = instrument;
 
-      // Create order JSON
-      rapidjson::Document order_doc;  // Renamed to avoid conflict
-      order_doc.SetObject();
-      auto& allocator = order_doc.GetAllocator();
+      // Store order request for tracking server response
+      // We'll move recordMessage and orderPlaced to response handling
+      LOG_INFO << "Order request sent, waiting for server confirmation: "
+               << client_order_id;
+      connection_mgr.recordMessage();
+      connection_mgr.orderPlaced();
 
-      order_doc.AddMember("type", "place_order", allocator);
-      // Use StringRef for instrument_id to avoid copying if instrument is
-      // short-lived
-      order_doc.AddMember("instrument_id",
-                          rapidjson::StringRef(instrument.c_str()), allocator);
-      order_doc.AddMember("side", rapidjson::StringRef(is_buy ? "buy" : "sell"),
-                          allocator);
-      order_doc.AddMember("price", target_price, allocator);
-      order_doc.AddMember("quantity", quantity, allocator);
-
-      // It's good practice to include a client-generated order ID if the
-      // exchange supports it. You'll need to generate this.
-      // std::string client_order_id = generateClientOrderId();
-      // order_doc.AddMember("client_order_id",
-      // rapidjson::StringRef(client_order_id.c_str()), allocator);
-
-      rapidjson::StringBuffer buffer;
-      rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
-      order_doc.Accept(writer);
-      std::string order_str = buffer.GetString();
-
-      LOG_INFO << "Attempting to send order: " << order_str;
-      wsClient->getConnection()->send(order_str);
-      connection_mgr.recordMessage();  // Record after successful send attempt
-      connection_mgr.orderPlaced();    // Increment pending orders after
-                                       // successful send attempt
-      // Store the client_order_id if you added one:
-      // active_client_orders_[client_order_id] = instrument;
-      LOG_INFO << "Order sent: " << order_str;
+      LOG_INFO << "Order placed: " << (is_buy ? "BUY" : "SELL") << " "
+               << quantity << " " << instrument << " at " << target_price
+               << " (client_order_id: " << client_order_id << ")";
 
     } catch (const std::exception& e) {
-      LOG_ERROR << "Order placement CRITICAL error for " << instrument << ": "
-                << e.what();
+      LOG_ERROR << "Failed to send order: " << e.what();
     }
   }
+
+  // void handleOrderResponse(const std::string& client_order_id, bool success,
+  //                          const std::string& server_order_id = "") {
+  //   auto it = pending_client_orders_.find(client_order_id);
+  //   if (it == pending_client_orders_.end()) {
+  //     LOG_ERROR << "Received response for unknown order: " << client_order_id;
+  //     return;
+  //   }
+
+  //   if (success) {
+  //     // Move from pending to active
+  //     active_client_orders_[client_order_id] = it->second;
+  //     pending_client_orders_.erase(it);
+
+  //     connection_mgr.orderPlaced();
+  //     LOG_INFO << "Order confirmed by server: " << client_order_id;
+
+  //     if (!server_order_id.empty()) {
+  //       // Store server order ID mapping if needed
+  //       server_to_client_orders_[server_order_id] = client_order_id;
+  //     }
+  //   } else {
+  //     // Order rejected - remove from pending
+  //     pending_client_orders_.erase(it);
+  //     LOG_ERROR << "Order rejected by server: " << client_order_id;
+  //   }
+  // }
 
   // Helper methods
   std::tuple<std::string, std::string, int, long> parseInstrumentName(
@@ -921,17 +1023,20 @@ class TradingWebSocketClient {
 
         if (candleArray.IsArray() && candleArray.Size() > 0 &&
             candleArray[0].IsObject()) {
-          CandleData candle_data(candleArray[0]); // Renamed to avoid conflict if 'candle' is a keyword or macro
-          this->updateInstrumentFeatures(instrumentName, candle_data, timestamp);
-          this->onCandleUpdate(instrumentName, candle_data, timestamp, true);
-          this->dumpTradeableInstrument(timestamp, instrumentName, candle_data);
+          CandleData candle(candleArray[0]);
+          // Directly update features for tradeable instruments here
+          updateInstrumentFeatures(instrumentName, candle, timestamp);
+          onCandleUpdate(instrumentName, candle, timestamp,
+                         true);  // Call virtual method for logging/other
+                                 // derived class logic
+          dumpTradeableInstrument(timestamp, instrumentName, candle);
         }
       }
     }
 
     // Process untradeable instruments
     if (candles.HasMember("untradeable") && candles["untradeable"].IsObject()) {
-      std::fill(this->candlesTick.begin(), this->candlesTick.end(), std::nullopt);
+      std::fill(candlesTick.begin(), candlesTick.end(), std::nullopt);
       const rapidjson::Value& untradeable = candles["untradeable"];
 
       for (auto& member : untradeable.GetObject()) {
@@ -940,23 +1045,23 @@ class TradingWebSocketClient {
 
         if (candleArray.IsArray() && candleArray.Size() > 0 &&
             candleArray[0].IsObject()) {
-          CandleData candle_data(candleArray[0]); // Renamed
-          
-          this->updateUnderlyingPrice(instrumentName, candle_data.mid); 
-
-          size_t idx = getIndex(instrumentName); 
-          if (idx < this->candlesTick.size()) {
-            this->candlesTick[idx] = candle_data;
-          } else {
-            LOG_WARN << "Invalid index " << idx << " from getIndex for instrument " 
-                     << instrumentName << " for candlesTick array size " << this->candlesTick.size();
-          }
-          this->onCandleUpdate(instrumentName, candle_data, timestamp, false);
+          CandleData candle(candleArray[0]);
+          // For untradeable, you might only want to update underlying prices or
+          // specific features If they also need full feature updates:
+          // updateInstrumentFeatures(instrumentName, candle, timestamp);
+          if (getIndex(instrumentName) <
+              underlying_prices
+                  .size())  // Assuming getIndex maps to an underlying
+            updateUnderlyingPrice(instrumentName,
+                                  candle.mid);  // Or candle.close
+          onCandleUpdate(instrumentName, candle, timestamp,
+                         false);  // Call virtual method for logging/other
+                                  // derived class logic
+          candlesTick[getIndex(instrumentName)] = candle;
         }
       }
     }
-    // Moved this call to be the last statement inside this method
-    CandleData::dumpCandles(this->csvUnderlyingPrices, timestamp, this->candlesTick);
+    CandleData::dumpCandles(csvUnderlyingPrices, timestamp, candlesTick);
   }
 
   void processOrderbookData(const rapidjson::Value& orderbooks,
@@ -967,32 +1072,32 @@ class TradingWebSocketClient {
 
       if (orderbookData.IsObject()) {
         OrderBookLevel orderbook(orderbookData);
-        this->onOrderbookUpdate(instrumentName, orderbook, timestamp);
-        this->dumpOrderbookFeatures(timestamp, instrumentName, orderbook);
+        onOrderbookUpdate(instrumentName, orderbook, timestamp);
+        dumpOrderbookFeatures(timestamp, instrumentName, orderbook);
       }
     }
   }
 
   void processEventsData(const rapidjson::Value& events, long timestamp) {
     for (rapidjson::SizeType i = 0; i < events.Size(); ++i) {
-      const rapidjson::Value& event_json = events[i]; // Renamed to avoid conflict
+      const rapidjson::Value& event = events[i];
 
-      if (!event_json.IsObject() || !event_json.HasMember("event_type") ||
-          !event_json["event_type"].IsString()) {
+      if (!event.IsObject() || !event.HasMember("event_type") ||
+          !event["event_type"].IsString()) {
         continue;
       }
 
-      const char* eventType = event_json["event_type"].GetString();
+      const char* eventType = event["event_type"].GetString();
 
-      if (strcmp(eventType, "trade") == 0 && event_json.HasMember("data") &&
-          event_json["data"].IsObject()) {
-        TradeEvent trade_event(event_json["data"]); // Use new name
-        this->onTradeEvent(trade_event);
-        this->dumpTradeFeatures(trade_event);
-      } else if (strcmp(eventType, "cancel") == 0 && event_json.HasMember("data") &&
-                 event_json["data"].IsObject()) {
-        CancelEvent cancel_event(event_json["data"]); // Use new name
-        this->onCancelEvent(cancel_event);
+      if (strcmp(eventType, "trade") == 0 && event.HasMember("data") &&
+          event["data"].IsObject()) {
+        TradeEvent trade(event["data"]);
+        onTradeEvent(trade);
+        dumpTradeFeatures(trade);
+      } else if (strcmp(eventType, "cancel") == 0 && event.HasMember("data") &&
+                 event["data"].IsObject()) {
+        CancelEvent cancel(event["data"]);
+        onCancelEvent(cancel);
       }
     }
   }
@@ -1000,84 +1105,89 @@ class TradingWebSocketClient {
   void dumpTradeableInstrument(long timestamp,
                                const std::string& instrumentName,
                                const CandleData& candle) {
+    // Parse instrument name to extract features
     auto [instrumentType, underlying, strikePrice, expiry] =
-        this->parseInstrumentName(instrumentName);
+        parseInstrumentName(instrumentName);
 
-    double underlyingPriceValue = this->getUnderlyingPrice(underlying);
-
-    long timeToExpirySeconds = expiry - timestamp;
-    if (timeToExpirySeconds < 0) timeToExpirySeconds = 0;
-
-    double moneynessValue = 0;
-    if ((instrumentType == "call" || instrumentType == "put") && underlyingPriceValue > 0) {
-      moneynessValue = static_cast<double>(strikePrice) / underlyingPriceValue;
+    // Get underlying price
+    int underlyingIndex = getIndex(underlying);
+    double underlyingPrice = 0;
+    if (underlyingIndex < candlesTick.size() &&
+        candlesTick[underlyingIndex].has_value()) {
+      underlyingPrice = candlesTick[underlyingIndex]->mid;
     }
 
-    this->csvTradeableInstruments
+    // Calculate time to expiry (in seconds)
+    long timeToExpiry = expiry - timestamp;
+
+    // Calculate moneyness (for options)
+    double moneyness = 0;
+    if (instrumentType != "future" && underlyingPrice > 0) {
+      moneyness = static_cast<double>(strikePrice) / underlyingPrice;
+    }
+
+    csvTradeableInstruments
         << timestamp << "," << instrumentName << "," << instrumentType << ","
         << underlying << "," << strikePrice << "," << expiry << ","
         << candle.open << "," << candle.close << "," << candle.high << ","
         << candle.low << "," << candle.volume << "," << candle.index << ","
-        << underlyingPriceValue << "," << timeToExpirySeconds << "," << moneynessValue << "\n";
-    this->csvTradeableInstruments.flush();
+        << underlyingPrice << "," << timeToExpiry << "," << moneyness << "\n";
+    csvTradeableInstruments.flush();
   }
 
   void dumpOrderbookFeatures(long timestamp, const std::string& instrumentName,
                              const OrderBookLevel& orderbook) {
-    double spreadVal = 0, midPriceVal = 0, bidAskRatioVal = 0, depthImbalanceVal = 0;
+    // Calculate orderbook features
+    double spread = 0, midPrice = 0, bidAskRatio = 0, depthImbalance = 0;
 
     if (!orderbook.bids.empty() && !orderbook.asks.empty()) {
       int bestBid = orderbook.bids.rbegin()->first;
       int bestAsk = orderbook.asks.begin()->first;
-      spreadVal = bestAsk - bestBid;
-      if (spreadVal < 0) spreadVal = 0;
-      midPriceVal = (bestBid + bestAsk) / 2.0;
+      spread = bestAsk - bestBid;
+      midPrice = (bestBid + bestAsk) / 2.0;
 
-      long long totalBidVolume = 0, totalAskVolume = 0;
+      // Calculate bid/ask volume ratio
+      int totalBidVolume = 0, totalAskVolume = 0;
       for (const auto& [price, qty] : orderbook.bids) totalBidVolume += qty;
       for (const auto& [price, qty] : orderbook.asks) totalAskVolume += qty;
 
-      if (totalAskVolume > 0) {
-        bidAskRatioVal = static_cast<double>(totalBidVolume) / totalAskVolume;
-      } else {
-        bidAskRatioVal = (totalBidVolume > 0) ? 1.0e9 : 1.0;
-      }
-      if (totalBidVolume + totalAskVolume > 0) {
-        depthImbalanceVal = static_cast<double>(totalBidVolume - totalAskVolume) /
-                           (totalBidVolume + totalAskVolume);
-      } else {
-        depthImbalanceVal = 0.0;
-      }
+      if (totalAskVolume > 0)
+        bidAskRatio = static_cast<double>(totalBidVolume) / totalAskVolume;
+      depthImbalance = static_cast<double>(totalBidVolume - totalAskVolume) /
+                       static_cast<double>(totalBidVolume + totalAskVolume);
     }
 
+    // Dump bid levels
     int level = 0;
     for (const auto& [price, quantity] : orderbook.bids) {
-      this->csvOrderbookData << timestamp << "," << instrumentName << ",bid,"
+      csvOrderbookData << timestamp << "," << instrumentName << ",bid,"
                        << level++ << "," << price << "," << quantity << ","
-                       << spreadVal << "," << midPriceVal << "," << bidAskRatioVal << ","
-                       << depthImbalanceVal << "\n";
-      if (level >= 3) break;
+                       << spread << "," << midPrice << "," << bidAskRatio << ","
+                       << depthImbalance << "\n";
+      if (level >= 3) break;  // Top 3 levels
     }
 
+    // Dump ask levels
     level = 0;
     for (const auto& [price, quantity] : orderbook.asks) {
-      this->csvOrderbookData << timestamp << "," << instrumentName << ",ask,"
+      csvOrderbookData << timestamp << "," << instrumentName << ",ask,"
                        << level++ << "," << price << "," << quantity << ","
-                       << spreadVal << "," << midPriceVal << "," << bidAskRatioVal << ","
-                       << depthImbalanceVal << "\n";
-      if (level >= 3) break;
+                       << spread << "," << midPrice << "," << bidAskRatio << ","
+                       << depthImbalance << "\n";
+      if (level >= 3) break;  // Top 3 levels
     }
-    this->csvOrderbookData.flush();
+    csvOrderbookData.flush();
   }
 
   void dumpTradeFeatures(const TradeEvent& trade) {
-    int tradeDirection = 0;
+    // Determine trade direction (1 for buy, -1 for sell, 0 for unknown)
+    int tradeDirection = 0;  // Would need more logic to determine this
 
-    this->csvTradeEvents << trade.time << "," << trade.instrumentID << ","
+    csvTradeEvents << trade.time << "," << trade.instrumentID << ","
                    << trade.price << "," << trade.quantity << ","
                    << trade.passiveOrderID << "," << trade.activeOrderID << ","
                    << tradeDirection << "\n";
-    this->csvTradeEvents.flush();
+    csvTradeEvents.flush();
   }
 
   // Override these methods to handle specific data
