@@ -136,6 +136,9 @@ class TradingWebSocketClient {
 
   // Track order expiry times (client_order_id -> expiry_timestamp)
   std::unordered_map<std::string, long> order_expiry_times_;
+  
+  // Track latest timestamp for more accurate expiry calculation
+  long latest_timestamp_ = 0;
 
   // Rate limiting
   struct ConnectionManager {
@@ -358,8 +361,14 @@ class TradingWebSocketClient {
                            ? json["time"].GetInt64()
                            : 0;
 
+      // Update latest timestamp for accurate expiry calculation
+      latest_timestamp_ = timestamp;
+
       // Clean up expired orders first
       cleanupExpiredOrders(timestamp);
+      
+      // Clean up expired instruments from cache
+      cleanupExpiredInstruments(timestamp);
       
       // Validate order counters periodically
       validateOrderCounters();
@@ -699,6 +708,14 @@ class TradingWebSocketClient {
 
     for (const auto& [instrument, features_obj] :
          current_features) {  // Renamed 'features' to 'features_obj'
+      // Check if instrument has expired before processing
+      auto [type, underlying, strike, expiry_timestamp] = parseInstrumentName(instrument);
+      if ((type == "call" || type == "put" || type == "future") && expiry_timestamp > 0) {
+        if (timestamp >= expiry_timestamp) {
+          continue;  // Skip expired instruments
+        }
+      }
+      
       // Only predict for instruments with complete data
       auto orderbook_it = latest_orderbook.find(instrument);
       if (orderbook_it != latest_orderbook.end() &&
@@ -875,7 +892,10 @@ class TradingWebSocketClient {
     order_doc.SetObject();
     auto& allocator = order_doc.GetAllocator();
 
-    int exp = timestamp + 3000;
+    // Use a small buffer to account for processing delay, but keep it short
+    // Use the latest timestamp we've seen, not the old one from market data processing
+    // Add extra buffer to ensure expiry is in future when order reaches server
+    int exp = latest_timestamp_ + 6000;  // 6 seconds from latest tick
 
     std::string instr_name = "";
 
@@ -1422,6 +1442,39 @@ class TradingWebSocketClient {
 
       // Decrement pending orders count to free up the slot
       connection_mgr.orderFilledOrCancelled();
+    }
+  }
+
+  void cleanupExpiredInstruments(long current_timestamp) {
+    std::vector<std::string> expired_instruments;
+    
+    // Check all instruments in current_features for expiry
+    for (const auto& [instrument, features] : current_features) {
+      auto [type, underlying, strike, expiry_timestamp] = parseInstrumentName(instrument);
+      
+      // Only check options and futures with expiry times
+      if ((type == "call" || type == "put" || type == "future") && expiry_timestamp > 0) {
+        if (current_timestamp >= expiry_timestamp) {
+          expired_instruments.push_back(instrument);
+        }
+      }
+    }
+    
+    // Remove expired instruments from all cached data structures
+    for (const std::string& instrument : expired_instruments) {
+      LOG_INFO << "Removing expired instrument from cache: " << instrument;
+      
+      // Remove from all cached data structures
+      current_features.erase(instrument);
+      latest_orderbook.erase(instrument);
+      price_history.erase(instrument);
+      trade_history.erase(instrument);
+      
+      // Note: underlying_prices contains spot prices like "$CARD" so we don't remove those
+    }
+    
+    if (!expired_instruments.empty()) {
+      LOG_INFO << "Cleaned up " << expired_instruments.size() << " expired instruments from cache";
     }
   }
 
