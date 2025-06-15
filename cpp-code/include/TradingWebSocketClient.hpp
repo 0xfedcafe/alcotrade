@@ -130,6 +130,9 @@ class TradingWebSocketClient {
   std::unordered_map<std::string, double> underlying_prices;
   // Map to store client_order_id to instrument_id and other details if needed
   std::unordered_map<std::string, std::string> active_client_orders_;
+  std::unordered_map<std::string, std::string> pending_client_orders_;
+  std::unordered_map<std::string, std::string>
+      server_to_client_orders_;  // optional
 
   // Rate limiting
   struct ConnectionManager {
@@ -887,32 +890,32 @@ class TradingWebSocketClient {
     }
   }
 
-  // void handleOrderResponse(const std::string& client_order_id, bool success,
-  //                          const std::string& server_order_id = "") {
-  //   auto it = pending_client_orders_.find(client_order_id);
-  //   if (it == pending_client_orders_.end()) {
-  //     LOG_ERROR << "Received response for unknown order: " << client_order_id;
-  //     return;
-  //   }
+  void handleOrderResponse(const std::string& client_order_id, bool success,
+                           const std::string& server_order_id = "") {
+    auto it = pending_client_orders_.find(client_order_id);
+    if (it == pending_client_orders_.end()) {
+      LOG_ERROR << "Received response for unknown order: " << client_order_id;
+      return;
+    }
 
-  //   if (success) {
-  //     // Move from pending to active
-  //     active_client_orders_[client_order_id] = it->second;
-  //     pending_client_orders_.erase(it);
+    if (success) {
+      // Move from pending to active
+      active_client_orders_[client_order_id] = it->second;
+      pending_client_orders_.erase(it);
 
-  //     connection_mgr.orderPlaced();
-  //     LOG_INFO << "Order confirmed by server: " << client_order_id;
+      connection_mgr.orderPlaced();
+      LOG_INFO << "Order confirmed by server: " << client_order_id;
 
-  //     if (!server_order_id.empty()) {
-  //       // Store server order ID mapping if needed
-  //       server_to_client_orders_[server_order_id] = client_order_id;
-  //     }
-  //   } else {
-  //     // Order rejected - remove from pending
-  //     pending_client_orders_.erase(it);
-  //     LOG_ERROR << "Order rejected by server: " << client_order_id;
-  //   }
-  // }
+      if (!server_order_id.empty()) {
+        // Store server order ID mapping if needed
+        server_to_client_orders_[server_order_id] = client_order_id;
+      }
+    } else {
+      // Order rejected - remove from pending
+      pending_client_orders_.erase(it);
+      LOG_ERROR << "Order rejected by server: " << client_order_id;
+    }
+  }
 
   // Helper methods
   std::tuple<std::string, std::string, int, long> parseInstrumentName(
