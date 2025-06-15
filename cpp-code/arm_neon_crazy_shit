@@ -1,0 +1,679 @@
+#pragma once
+#include <coroutine>
+#include <vector>
+#include <memory>
+#include <atomic>
+#include <thread>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <unordered_map>
+#include <chrono>
+
+// ARM NEON intrinsics instead of AVX2
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
+#include "RandomForestRegressor.hpp"
+#include "TradingStructures.hpp"
+
+// Cache-line optimized for ARM Cortex-A72 (Pi 4)
+template<typename T, size_t Size>
+class ARMLockFreeRingBuffer {
+private:
+    static_assert((Size & (Size - 1)) == 0, "Size must be power of 2");
+    
+    // ARM cache line is 64 bytes
+    alignas(64) std::atomic<size_t> head_{0};
+    alignas(64) std::atomic<size_t> tail_{0};
+    alignas(64) std::array<T, Size> buffer_;
+    
+public:
+    bool try_push(const T& item) {
+        const size_t current_tail = tail_.load(std::memory_order_relaxed);
+        const size_t next_tail = (current_tail + 1) & (Size - 1);
+        
+        if (next_tail == head_.load(std::memory_order_acquire)) {
+            return false; // Full
+        }
+        
+        buffer_[current_tail] = item;
+        tail_.store(next_tail, std::memory_order_release);
+        return true;
+    }
+    
+    bool try_pop(T& item) {
+        const size_t current_head = head_.load(std::memory_order_relaxed);
+        
+        if (current_head == tail_.load(std::memory_order_acquire)) {
+            return false; // Empty
+        }
+        
+        item = buffer_[current_head];
+        head_.store((current_head + 1) & (Size - 1), std::memory_order_release);
+        return true;
+    }
+};
+
+// ARM-optimized feature vector (16-byte aligned for NEON)
+struct alignas(16) ARMFastFeatures {
+    union {
+        struct {
+            float price_features[4];      // open, close, high, low
+            float volume_features[4];     // volume, underlying, time_to_expiry, moneyness
+            float orderbook_features[4];  // spread, mid, bid_ask_ratio, depth_imbalance
+            float technical_features[4];  // momentum, rsi, volatility, trade_count
+        };
+        float all_features[16];
+    };
+    
+    ARMFastFeatures() {
+        #ifdef __ARM_NEON
+        // Zero-initialize using NEON (4 floats at a time)
+        for (int i = 0; i < 16; i += 4) {
+            vst1q_f32(&all_features[i], vdupq_n_f32(0.0f));
+        }
+        #else
+        std::fill(all_features, all_features + 16, 0.0f);
+        #endif
+    }
+    
+    std::vector<double> toVector() const {
+        return std::vector<double>(all_features, all_features + 16);
+    }
+};
+
+// Raspberry Pi optimized trading engine
+class RaspberryPiTradingEngine {
+private:
+    std::unique_ptr<RandomForestRegressor> price_model_;
+    std::unique_ptr<RandomForestRegressor> direction_model_;
+    
+    // Smaller buffers for Pi's limited memory
+    using EventBuffer = ARMLockFreeRingBuffer<MarketEvent, 4096>;
+    using PredictionBuffer = ARMLockFreeRingBuffer<std::pair<std::string, double>, 1024>;
+    
+    EventBuffer market_events_;
+    PredictionBuffer predictions_;
+    
+    // Lightweight instrument data for Pi
+    struct alignas(16) PiInstrumentData {
+        ARMFastFeatures features;
+        std::atomic<long> last_update{0};
+        
+        // Smaller history buffers to save memory
+        std::vector<CandleData> price_history; // Limited size
+        std::vector<TradeEvent> trade_history;  // Limited size
+        OrderBookLevel latest_orderbook;
+        
+        alignas(16) std::atomic<bool> needs_prediction{false};
+        alignas(16) std::atomic<bool> processing{false};
+        
+        PiInstrumentData() {
+            price_history.reserve(60);  // 1 minute of data
+            trade_history.reserve(100); // Last 100 trades
+        }
+    };
+    
+    std::unordered_map<std::string, std::unique_ptr<PiInstrumentData>> instruments_;
+    
+    // Use fewer threads on Pi (4 cores max)
+    std::vector<std::thread> worker_threads_;
+    std::atomic<bool> running_{true};
+    
+    // Pi-optimized rate limiter
+    struct alignas(16) PiRateLimiter {
+        std::atomic<int> messages_this_second{0};
+        std::atomic<int> pending_orders{0};
+        std::atomic<long> last_reset_time{0};
+        
+        static constexpr int MAX_MESSAGES_PER_SECOND = 250; // Conservative for Pi
+        static constexpr int MAX_PENDING_ORDERS = 500;
+        
+        bool canSendMessage() {
+            auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            
+            auto last_reset = last_reset_time.load(std::memory_order_acquire);
+            if (now > last_reset) {
+                if (last_reset_time.compare_exchange_weak(last_reset, now, std::memory_order_acq_rel)) {
+                    messages_this_second.store(0, std::memory_order_release);
+                }
+            }
+            
+            return messages_this_second.fetch_add(1, std::memory_order_acq_rel) < MAX_MESSAGES_PER_SECOND;
+        }
+        
+        bool canPlaceOrder() {
+            return pending_orders.load(std::memory_order_acquire) < MAX_PENDING_ORDERS;
+        }
+        
+        void orderPlaced() { pending_orders.fetch_add(1, std::memory_order_acq_rel); }
+        void orderFilled() { pending_orders.fetch_sub(1, std::memory_order_acq_rel); }
+    } rate_limiter_;
+
+public:
+    RaspberryPiTradingEngine() {
+        price_model_ = std::make_unique<RandomForestRegressor>();
+        direction_model_ = std::make_unique<RandomForestRegressor>();
+        
+        price_model_->loadModel("price_model.bin");
+        direction_model_->loadModel("direction_model.bin");
+        
+        // Pi 4 has 4 cores, leave one for OS
+        const size_t num_worker_threads = 2;
+        
+        for (size_t i = 0; i < num_worker_threads; ++i) {
+            worker_threads_.emplace_back([this, i]() { 
+                setPiThreadAffinity(i);
+                workerLoop(i); 
+            });
+        }
+        
+        // Prediction and trading on separate threads
+        worker_threads_.emplace_back([this]() { 
+            setPiThreadAffinity(2);
+            predictionLoop(); 
+        });
+        
+        worker_threads_.emplace_back([this]() { 
+            setPiThreadAffinity(3);
+            tradingLoop(); 
+        });
+    }
+    
+    ~RaspberryPiTradingEngine() {
+        running_.store(false);
+        for (auto& thread : worker_threads_) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+    }
+    
+    void onMarketDataUpdate(const rapidjson::Document& json) {
+        long timestamp = json.HasMember("time") && json["time"].IsInt64() ? 
+                        json["time"].GetInt64() : 0;
+        
+        // Streamlined processing for Pi's limited resources
+        if (json.HasMember("candles") && json["candles"].IsObject()) {
+            processCandles(json["candles"], timestamp);
+        }
+        
+        if (json.HasMember("orderbook_depths") && json["orderbook_depths"].IsObject()) {
+            processOrderbooks(json["orderbook_depths"], timestamp);
+        }
+        
+        if (json.HasMember("events") && json["events"].IsArray()) {
+            processEvents(json["events"], timestamp);
+        }
+    }
+
+private:
+    void setPiThreadAffinity(size_t cpu_core) {
+        #ifdef __linux__
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(cpu_core % 4, &cpuset); // Pi 4 has 4 cores
+        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+        
+        // Set thread priority for real-time performance
+        struct sched_param param;
+        param.sched_priority = sched_get_priority_max(SCHED_FIFO) - 1;
+        pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
+        #endif
+    }
+    
+    void processCandles(const rapidjson::Value& candles, long timestamp) {
+        if (candles.HasMember("tradeable") && candles["tradeable"].IsObject()) {
+            for (auto& member : candles["tradeable"].GetObject()) {
+                const std::string instrument = member.name.GetString();
+                const auto& candleArray = member.value;
+                
+                if (candleArray.IsArray() && candleArray.Size() > 0) {
+                    MarketEvent event(MarketEvent::CANDLE_UPDATE, instrument, timestamp);
+                    event.candle = CandleData(candleArray[0]);
+                    
+                    // Non-blocking push with backpressure
+                    if (!market_events_.try_push(event)) {
+                        // Drop oldest event if buffer is full
+                        MarketEvent dummy;
+                        market_events_.try_pop(dummy);
+                        market_events_.try_push(event);
+                    }
+                }
+            }
+        }
+    }
+    
+    void processOrderbooks(const rapidjson::Value& orderbooks, long timestamp) {
+        for (auto& member : orderbooks.GetObject()) {
+            const std::string instrument = member.name.GetString();
+            
+            MarketEvent event(MarketEvent::ORDERBOOK_UPDATE, instrument, timestamp);
+            event.orderbook = OrderBookLevel(member.value);
+            
+            if (!market_events_.try_push(event)) {
+                MarketEvent dummy;
+                market_events_.try_pop(dummy);
+                market_events_.try_push(event);
+            }
+        }
+    }
+    
+    void processEvents(const rapidjson::Value& events, long timestamp) {
+        for (rapidjson::SizeType i = 0; i < events.Size(); ++i) {
+            const auto& event = events[i];
+            
+            if (event.IsObject() && event.HasMember("event_type") && 
+                event["event_type"].IsString() && 
+                strcmp(event["event_type"].GetString(), "trade") == 0 &&
+                event.HasMember("data")) {
+                
+                TradeEvent trade(event["data"]);
+                
+                MarketEvent market_event(MarketEvent::TRADE_EVENT, trade.instrumentID, timestamp);
+                market_event.trade = trade;
+                
+                if (!market_events_.try_push(market_event)) {
+                    MarketEvent dummy;
+                    market_events_.try_pop(dummy);
+                    market_events_.try_push(market_event);
+                }
+            }
+        }
+    }
+    
+    void workerLoop(size_t worker_id) {
+        MarketEvent event;
+        while (running_.load(std::memory_order_acquire)) {
+            if (market_events_.try_pop(event)) {
+                processEventCoroutine(event);
+            } else {
+                // Longer sleep on Pi to reduce power consumption
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+        }
+    }
+    
+    FeatureTask processEventCoroutine(const MarketEvent& event) {
+        auto& instrument_data = getOrCreateInstrumentData(event.instrument);
+        
+        bool expected = false;
+        if (!instrument_data->processing.compare_exchange_weak(expected, true, std::memory_order_acq_rel)) {
+            co_return;
+        }
+        
+        switch (event.type) {
+            case MarketEvent::CANDLE_UPDATE:
+                co_await updateCandleFeaturesNEON(*instrument_data, event.candle, event.timestamp);
+                break;
+            case MarketEvent::ORDERBOOK_UPDATE:
+                co_await updateOrderbookFeaturesNEON(*instrument_data, event.orderbook, event.timestamp);
+                break;
+            case MarketEvent::TRADE_EVENT:
+                co_await updateTradeFeaturesNEON(*instrument_data, event.trade, event.timestamp);
+                break;
+        }
+        
+        instrument_data->needs_prediction.store(true, std::memory_order_release);
+        instrument_data->last_update.store(event.timestamp, std::memory_order_release);
+        instrument_data->processing.store(false, std::memory_order_release);
+    }
+    
+    // ARM NEON optimized feature updates
+    FeatureSuspender updateCandleFeaturesNEON(PiInstrumentData& data, const CandleData& candle, long timestamp) {
+        auto& features = data.features;
+        
+        #ifdef __ARM_NEON
+        // NEON optimized feature update (4 floats at once)
+        float32x4_t price_vec = {
+            static_cast<float>(candle.open),
+            static_cast<float>(candle.close),
+            static_cast<float>(candle.high),
+            static_cast<float>(candle.low)
+        };
+        vst1q_f32(features.price_features, price_vec);
+        
+        features.volume_features[0] = static_cast<float>(candle.volume);
+        #else
+        // Fallback for non-NEON systems
+        features.price_features[0] = static_cast<float>(candle.open);
+        features.price_features[1] = static_cast<float>(candle.close);
+        features.price_features[2] = static_cast<float>(candle.high);
+        features.price_features[3] = static_cast<float>(candle.low);
+        features.volume_features[0] = static_cast<float>(candle.volume);
+        #endif
+        
+        // Memory-efficient history management
+        data.price_history.push_back(candle);
+        if (data.price_history.size() > 60) { // Keep only 1 minute
+            data.price_history.erase(data.price_history.begin());
+        }
+        
+        calculateTechnicalIndicatorsNEON(features, data.price_history);
+        
+        return {};
+    }
+    
+    FeatureSuspender updateOrderbookFeaturesNEON(PiInstrumentData& data, const OrderBookLevel& orderbook, long timestamp) {
+        data.latest_orderbook = orderbook;
+        auto& features = data.features;
+        
+        if (!orderbook.bids.empty() && !orderbook.asks.empty()) {
+            int best_bid = orderbook.bids.rbegin()->first;
+            int best_ask = orderbook.asks.begin()->first;
+            
+            #ifdef __ARM_NEON
+            float32x4_t orderbook_vec = {
+                static_cast<float>(best_ask - best_bid),  // spread
+                static_cast<float>((best_bid + best_ask) / 2.0),  // mid
+                0.0f,  // Will calculate bid_ask_ratio
+                0.0f   // Will calculate depth_imbalance
+            };
+            
+            // Calculate volume metrics
+            int total_bid_vol = 0, total_ask_vol = 0;
+            for (const auto& [price, qty] : orderbook.bids) total_bid_vol += qty;
+            for (const auto& [price, qty] : orderbook.asks) total_ask_vol += qty;
+            
+            if (total_ask_vol > 0) {
+                orderbook_vec[2] = static_cast<float>(total_bid_vol) / total_ask_vol;
+            }
+            
+            if (total_bid_vol + total_ask_vol > 0) {
+                orderbook_vec[3] = static_cast<float>(total_bid_vol - total_ask_vol) / 
+                                  (total_bid_vol + total_ask_vol);
+            }
+            
+            vst1q_f32(features.orderbook_features, orderbook_vec);
+            #else
+            // Fallback implementation
+            features.orderbook_features[0] = static_cast<float>(best_ask - best_bid);
+            features.orderbook_features[1] = static_cast<float>((best_bid + best_ask) / 2.0);
+            
+            int total_bid_vol = 0, total_ask_vol = 0;
+            for (const auto& [price, qty] : orderbook.bids) total_bid_vol += qty;
+            for (const auto& [price, qty] : orderbook.asks) total_ask_vol += qty;
+            
+            if (total_ask_vol > 0) {
+                features.orderbook_features[2] = static_cast<float>(total_bid_vol) / total_ask_vol;
+            }
+            
+            if (total_bid_vol + total_ask_vol > 0) {
+                features.orderbook_features[3] = static_cast<float>(total_bid_vol - total_ask_vol) / 
+                                               (total_bid_vol + total_ask_vol);
+            }
+            #endif
+        }
+        
+        return {};
+    }
+    
+    FeatureSuspender updateTradeFeaturesNEON(PiInstrumentData& data, const TradeEvent& trade, long timestamp) {
+        data.trade_history.push_back(trade);
+        if (data.trade_history.size() > 100) { // Keep last 100 trades
+            data.trade_history.erase(data.trade_history.begin());
+        }
+        
+        calculateTradeFeaturesNEON(data.features, data.trade_history, timestamp);
+        
+        return {};
+    }
+    
+    void calculateTechnicalIndicatorsNEON(ARMFastFeatures& features, const std::vector<CandleData>& history) {
+        if (history.size() < 14) return;
+        
+        #ifdef __ARM_NEON
+        // NEON-optimized RSI calculation
+        float32x4_t gains = vdupq_n_f32(0.0f);
+        float32x4_t losses = vdupq_n_f32(0.0f);
+        
+        // Process 4 price changes at once
+        size_t start_idx = history.size() - 14;
+        for (size_t i = start_idx; i < history.size() - 4; i += 4) {
+            float32x4_t current_prices = {
+                static_cast<float>(history[i+3].close),
+                static_cast<float>(history[i+2].close),
+                static_cast<float>(history[i+1].close),
+                static_cast<float>(history[i].close)
+            };
+            float32x4_t prev_prices = {
+                static_cast<float>(history[i+2].close),
+                static_cast<float>(history[i+1].close),
+                static_cast<float>(history[i].close),
+                static_cast<float>(history[i-1].close)
+            };
+            
+            float32x4_t changes = vsubq_f32(current_prices, prev_prices);
+            uint32x4_t positive_mask = vcgtq_f32(changes, vdupq_n_f32(0.0f));
+            
+            // Accumulate gains and losses
+            gains = vaddq_f32(gains, vandq_f32(changes, vreinterpretq_f32_u32(positive_mask)));
+            
+            float32x4_t neg_changes = vnegq_f32(changes);
+            uint32x4_t negative_mask = vmvnq_u32(positive_mask);
+            losses = vaddq_f32(losses, vandq_f32(neg_changes, vreinterpretq_f32_u32(negative_mask)));
+        }
+        
+        // Horizontal sum
+        float total_gains = vaddvq_f32(gains);  // ARM NEON reduction
+        float total_losses = vaddvq_f32(losses);
+        
+        if (total_losses > 0) {
+            float rs = total_gains / total_losses;
+            features.technical_features[0] = 100.0f - (100.0f / (1.0f + rs));
+        }
+        #else
+        // Scalar fallback
+        calculateTechnicalIndicatorsScalar(features, history);
+        #endif
+    }
+    
+    void calculateTechnicalIndicatorsScalar(ARMFastFeatures& features, const std::vector<CandleData>& history) {
+        if (history.size() >= 14) {
+            float gains = 0, losses = 0;
+            for (size_t i = history.size() - 14; i < history.size() - 1; ++i) {
+                float change = history[i + 1].close - history[i].close;
+                if (change > 0) gains += change;
+                else losses -= change;
+            }
+            
+            if (losses > 0) {
+                float rs = gains / losses;
+                features.technical_features[0] = 100.0f - (100.0f / (1.0f + rs));
+            }
+        }
+    }
+    
+    void calculateTradeFeaturesNEON(ARMFastFeatures& features, const std::vector<TradeEvent>& trades, long current_time) {
+        const long one_minute = 60000;
+        long cutoff_time = current_time - one_minute;
+        
+        float volume = 0, total_price = 0, count = 0;
+        
+        for (auto it = trades.rbegin(); it != trades.rend() && it->time > cutoff_time; ++it) {
+            volume += it->quantity;
+            total_price += it->price * it->quantity;
+            count += 1;
+        }
+        
+        #ifdef __ARM_NEON
+        float32x4_t trade_vec = {
+            volume,
+            count > 0 ? total_price / (volume + 1e-8f) : 0,
+            count,
+            0.0f  // Placeholder for volatility
+        };
+        vst1q_f32(features.technical_features, trade_vec);
+        #else
+        features.technical_features[0] = volume;
+        features.technical_features[1] = count > 0 ? total_price / (volume + 1e-8f) : 0;
+        features.technical_features[2] = count;
+        #endif
+    }
+    
+    void predictionLoop() {
+        std::vector<std::string> batch_instruments;
+        std::vector<std::vector<double>> batch_features;
+        batch_instruments.reserve(200); // Smaller batches for Pi
+        batch_features.reserve(200);
+        
+        while (running_.load(std::memory_order_acquire)) {
+            batch_instruments.clear();
+            batch_features.clear();
+            
+            for (auto& [instrument, data] : instruments_) {
+                if (data->needs_prediction.exchange(false, std::memory_order_acq_rel)) {
+                    batch_instruments.push_back(instrument);
+                    batch_features.push_back(data->features.toVector());
+                }
+            }
+            
+            if (!batch_features.empty()) {
+                auto price_predictions = price_model_->predictBatch(batch_features);
+                auto direction_predictions = direction_model_->predictBatch(batch_features);
+                
+                for (size_t i = 0; i < batch_instruments.size(); ++i) {
+                    predictions_.try_push({batch_instruments[i], price_predictions[i]});
+                    predictions_.try_push({batch_instruments[i] + "_dir", direction_predictions[i]});
+                }
+            }
+            
+            // Longer sleep on Pi to reduce CPU usage
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    
+    void tradingLoop() {
+        std::pair<std::string, double> prediction;
+        std::unordered_map<std::string, double> latest_predictions;
+        
+        while (running_.load(std::memory_order_acquire)) {
+            while (predictions_.try_pop(prediction)) {
+                latest_predictions[prediction.first] = prediction.second;
+            }
+            
+            for (auto it = latest_predictions.begin(); it != latest_predictions.end();) {
+                const std::string& key = it->first;
+                
+                if (key.ends_with("_dir")) {
+                    std::string instrument = key.substr(0, key.length() - 4);
+                    
+                    auto price_it = latest_predictions.find(instrument);
+                    if (price_it != latest_predictions.end()) {
+                        evaluateTradingSignal(instrument, price_it->second, it->second);
+                        
+                        latest_predictions.erase(price_it);
+                        it = latest_predictions.erase(it);
+                    } else {
+                        ++it;
+                    }
+                } else {
+                    ++it;
+                }
+            }
+            
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    
+    void evaluateTradingSignal(const std::string& instrument, double predicted_price, double direction_prob) {
+        auto instrument_it = instruments_.find(instrument);
+        if (instrument_it == instruments_.end()) return;
+        
+        auto& data = *instrument_it->second;
+        float current_mid = data.features.orderbook_features[1];
+        
+        if (current_mid <= 0) return;
+        
+        double expected_return = (predicted_price - current_mid) / current_mid;
+        
+        const double MIN_EXPECTED_RETURN = 0.002;
+        const double MIN_DIRECTION_CONFIDENCE = 0.65;
+        
+        bool should_buy = direction_prob > MIN_DIRECTION_CONFIDENCE && 
+                         expected_return > MIN_EXPECTED_RETURN;
+        bool should_sell = direction_prob < (1.0 - MIN_DIRECTION_CONFIDENCE) && 
+                          expected_return < -MIN_EXPECTED_RETURN;
+        
+        if ((should_buy || should_sell) && rate_limiter_.canSendMessage() && rate_limiter_.canPlaceOrder()) {
+            placeOrder(instrument, should_buy, data.latest_orderbook);
+        }
+    }
+    
+    void placeOrder(const std::string& instrument, bool is_buy, const OrderBookLevel& orderbook) {
+        rate_limiter_.orderPlaced();
+        LOG_INFO << "Pi placing " << (is_buy ? "BUY" : "SELL") << " order for " << instrument;
+    }
+    
+    PiInstrumentData* getOrCreateInstrumentData(const std::string& instrument) {
+        auto it = instruments_.find(instrument);
+        if (it == instruments_.end()) {
+            auto data = std::make_unique<PiInstrumentData>();
+            auto* ptr = data.get();
+            instruments_[instrument] = std::move(data);
+            return ptr;
+        }
+        return it->second.get();
+    }
+};
+
+
+-----------------------------------------------------------
+cmake_minimum_required(VERSION 3.10)
+project(alcotrade)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_BUILD_TYPE Release) # Use Release for Pi performance
+
+# Pi-specific optimizations
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcpu=cortex-a72 -mfpu=neon -mfloat-abi=hard")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -ffast-math -ftree-vectorize")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DARM_NEON")
+endif()
+
+# Enable coroutines
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fcoroutines")
+
+include("${CMAKE_SOURCE_DIR}/vendor/rapidjson.cmake")
+
+find_package(Drogon REQUIRED)
+
+file(GLOB SOURCES "src/*.cc")
+
+add_executable(alcotrade main.cc ${SOURCES})
+
+target_include_directories(alcotrade PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(alcotrade 
+    Drogon::Drogon
+    rapidjson
+    pthread
+)
+
+add_dependencies(alcotrade rapidjson)
+
+arm cmake 
+----------------------------------------------------------
+#!/bin/bash
+# optimize_pi.sh - Raspberry Pi performance tuning
+
+# Enable performance governor
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+# Increase GPU memory split for more RAM
+echo "gpu_mem=16" | sudo tee -a /boot/config.txt
+
+# Disable swap to reduce SD card wear
+sudo systemctl disable dphys-swapfile
+
+# Set real-time priority
+sudo setcap cap_sys_nice+ep ./alcotrade
+
+# Optimize network buffer sizes
+echo 'net.core.rmem_max = 134217728' | sudo tee -a /etc/sysctl.conf
+echo 'net.core.wmem_max = 134217728' | sudo tee -a /etc/sysctl.conf
+
+echo "Pi optimized for trading! Reboot recommended."
