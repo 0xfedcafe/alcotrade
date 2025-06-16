@@ -1,4 +1,4 @@
-# README for MyProject
+# README for AlgoTrade
 
 ## Overview
 Dumps JSON data to csv table for further processing
